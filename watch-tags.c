@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <fcntl.h>
+#include <memory.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,7 +91,13 @@ int main(int argc, char *argv[]) {
     }
 
     unsigned int n_watch_paths = argc - 1;
-    watch_path_s *watch_paths = malloc(n_watch_paths * sizeof(watch_path_s));
+    unsigned int mem_size = n_watch_paths * sizeof(watch_path_s) * 3;
+    void *memory = malloc(mem_size);
+    memset(memory, 0, mem_size);
+
+    watch_path_s *watch_paths = memory;
+    watch_path_s *dirty_watch_paths = watch_paths + n_watch_paths;
+    watch_path_s *queue_watch_paths = dirty_watch_paths + n_watch_paths;
 
     int inotify_fd = inotify_init();
     perr_die_if(inotify_fd < 0, "inotify_init");
@@ -105,10 +112,10 @@ int main(int argc, char *argv[]) {
     }
 
     watch_paths_s dirty_paths = {0};
-    dirty_paths.watch_paths = malloc(n_watch_paths * sizeof(watch_path_s));
+    dirty_paths.watch_paths = dirty_watch_paths;
 
     queue_state_s queue_state = {0};
-    queue_state.queue.watch_paths = malloc(n_watch_paths * sizeof(watch_path_s));
+    queue_state.queue.watch_paths = queue_watch_paths;
     queue_state.wait_time = 60;
 
     pthread_t thread;
