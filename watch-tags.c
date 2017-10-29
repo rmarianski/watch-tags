@@ -144,6 +144,11 @@ int main(int argc, char *argv[]) {
         perr_die_if(n < 0, "read");
         for (char *p = inotify_buf; p < inotify_buf + n; p += sizeof(struct inotify_event)) {
             struct inotify_event *e = (struct inotify_event *)p;
+            if (strcmp(e->name, "tags") == 0) {
+                // it's important to ignore tags modifications
+                // otherwise we'll get stuck in a loop!
+                continue;
+            }
             for (unsigned int wp_idx = 0; wp_idx < n_watch_paths; wp_idx++) {
                 watch_path_s *watched_path = watch_paths + wp_idx;
                 if (e->wd == watched_path->fd) {
