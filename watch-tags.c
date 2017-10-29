@@ -84,6 +84,18 @@ void *process_queue(void *pthread_data) {
     return NULL;
 }
 
+unsigned int parse_wait_time(char *s, unsigned int default_wait_time) {
+    unsigned int result = default_wait_time;
+    if (s) {
+        char *endptr = s;
+        unsigned int parsed_val = strtol(s, &endptr, 10);
+        if (endptr != s) {
+            result = parsed_val;
+        }
+    }
+    return result;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         die_usage(argv[0], "<watch-path>");
@@ -119,7 +131,8 @@ int main(int argc, char *argv[]) {
 
     queue_state_s queue_state = {0};
     queue_state.queue.watch_paths = queue_watch_paths;
-    queue_state.wait_time = 60;
+    char *wait_time_str = getenv("WATCHTAGS_WAIT_TIME");
+    queue_state.wait_time = parse_wait_time(wait_time_str, 60);
 
     pthread_t thread;
     perr_die_if(pthread_create(&thread, NULL, process_queue, &queue_state) != 0, "pthread_create");
