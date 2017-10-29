@@ -30,6 +30,7 @@ typedef struct {
     watch_paths_s queue;
     proc_state_s proc_state;
     unsigned int wait_time;
+    char *cmd;
 } queue_state_s;
 
 void add_watch_path(watch_paths_s *dps, watch_path_s *wp) {
@@ -56,9 +57,10 @@ bool enqueue_watch_paths(queue_state_s *qs, watch_paths_s *dps) {
     }
 }
 
-void path_changed(char *path) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd)-1, "ctagspath %s", path);
+void path_changed(queue_state_s *qs, char *path) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd)-1, "%s %s", qs->cmd, path);
+    puts(cmd);
     FILE *pipe = popen(cmd, "r");
     pclose(pipe);
 }
@@ -74,7 +76,7 @@ void *process_queue(void *pthread_data) {
         for (unsigned int i = 0; i < queue->n_used; i++) {
             watch_path_s *wp = queue->watch_paths + i;
 
-            path_changed(wp->path);
+            path_changed(qs, wp->path);
         }
         queue->n_used = 0;
         qs->proc_state = ProcState_None;
@@ -133,6 +135,12 @@ int main(int argc, char *argv[]) {
     queue_state.queue.watch_paths = queue_watch_paths;
     char *wait_time_str = getenv("WATCHTAGS_WAIT_TIME");
     queue_state.wait_time = parse_wait_time(wait_time_str, 60);
+    char *cmd = getenv("WATCHTAGS_CMD");
+    if (cmd) {
+        queue_state.cmd = cmd;
+    } else {
+        queue_state.cmd = "ctagspath";
+    }
 
     pthread_t thread;
     perr_die_if(pthread_create(&thread, NULL, process_queue, &queue_state) != 0, "pthread_create");
