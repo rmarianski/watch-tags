@@ -106,7 +106,7 @@ int main(int argc, char *argv[]) {
         int watch_fd = inotify_add_watch(
             inotify_fd,
             watch_path,
-            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
+            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
         );
         perr_die_if(watch_fd < 0, "inotify_add_watch");
         watch_path_s *watched_path = watch_paths + watch_path_idx++;
