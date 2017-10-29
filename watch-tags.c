@@ -57,7 +57,6 @@ bool enqueue_watch_paths(queue_state_s *qs, watch_paths_s *dps) {
 }
 
 void path_changed(char *path) {
-    puts(path);
     char cmd[256];
     snprintf(cmd, sizeof(cmd)-1, "ctagspath %s", path);
     FILE *pipe = popen(cmd, "r");
@@ -104,7 +103,11 @@ int main(int argc, char *argv[]) {
     unsigned int watch_path_idx = 0;
     for (unsigned int arg_idx = 1; arg_idx < argc; arg_idx++) {
         char *watch_path = argv[arg_idx];
-        int watch_fd = inotify_add_watch(inotify_fd, watch_path, IN_MODIFY);
+        int watch_fd = inotify_add_watch(
+            inotify_fd,
+            watch_path,
+            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
+        );
         perr_die_if(watch_fd < 0, "inotify_add_watch");
         watch_path_s *watched_path = watch_paths + watch_path_idx++;
         watched_path->fd = watch_fd;
