@@ -34,7 +34,7 @@ typedef struct {
     watch_link_s *first_queue;
     proc_state_s proc_state;
     unsigned int wait_time;
-    char *cmd;
+    pid_t pid;
 } queue_state_s;
 
 typedef struct {
@@ -44,7 +44,6 @@ typedef struct {
     watch_link_s *first_free;
 
     queue_state_s queue_state;
-
 } watch_state_s;
 
 watch_path_s *alloc_watch_path(watch_state_s *state) {
@@ -99,11 +98,21 @@ bool enqueue_watch_paths(watch_state_s *state, queue_state_s *qs, watch_link_s *
 }
 
 void path_changed(queue_state_s *qs, char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd)-1, "%s %s", qs->cmd, path);
-    puts(cmd);
-    FILE *pipe = popen(cmd, "r");
+    char tmpfile[32];
+    die_if(snprintf(tmpfile, sizeof(tmpfile), "/tmp/watch-tags-%d", qs->pid) >= sizeof(tmpfile), "snprintf");
+    char fullcmd[128];
+    die_if(snprintf(fullcmd, sizeof(fullcmd), "ctags -R -f %s", tmpfile) >= sizeof(fullcmd), "snprintf");
+
+    perr_die_if(chdir(path) != 0, "chdir");
+
+    FILE *pipe = popen(fullcmd, "r");
     pclose(pipe);
+
+    char tagspath[1024];
+    die_if(snprintf(tagspath, sizeof(tagspath), "%s/tags", path) >= sizeof(tagspath), "snprintf");
+    rename(tmpfile, tagspath);
+
+    puts(path);
 }
 
 void free_links(watch_state_s *state, watch_link_s *first_link) {
@@ -221,12 +230,7 @@ int main(int argc, char *argv[]) {
     queue_state_s *queue_state = &state.queue_state;
     char *wait_time_str = getenv("WATCHTAGS_WAIT_TIME");
     queue_state->wait_time = parse_wait_time(wait_time_str, 60);
-    char *cmd = getenv("WATCHTAGS_CMD");
-    if (cmd) {
-        queue_state->cmd = cmd;
-    } else {
-        queue_state->cmd = "ctagspath";
-    }
+    queue_state->pid = getpid();
 
     pthread_t thread;
     perr_die_if(pthread_create(&thread, NULL, process_queue, &state) != 0, "pthread_create");
