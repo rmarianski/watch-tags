@@ -200,10 +200,9 @@ void recursively_watch_dirs(watch_state_s *state, int inotify_fd, char *path, wa
             if (dp) {
                 while ((ep = readdir(dp))) {
                     if (ep->d_name[0] != '.') {
-                        char *fullpath;
-                        perr_die_if(asprintf(&fullpath, "%s/%s", path, ep->d_name) < 0, "asprintf");
+                        char fullpath[1024];
+                        perr_die_if(snprintf(fullpath, sizeof(fullpath), "%s/%s", path, ep->d_name) >= sizeof(fullpath), "snprintf");
                         recursively_watch_dirs(state, inotify_fd, fullpath, base);
-                        free(fullpath);
                     }
                 }
                 closedir(dp);
