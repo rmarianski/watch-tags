@@ -8,7 +8,10 @@
 #include <unistd.h>
 #include <ram-err.h>
 #include <sys/inotify.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <pthread.h>
+#include <dirent.h>
 
 typedef struct watch_path_s {
     char *path;
@@ -38,10 +41,10 @@ typedef struct {
     watch_link_s *first_watched;
     watch_link_s *first_dirty;
     watch_link_s *first_queue;
+    watch_link_s *first_free;
 
     queue_state_s queue_state;
 
-    watch_link_s *first_free;
 } watch_state_s;
 
 watch_path_s *alloc_watch_path(watch_state_s *state) {
@@ -145,6 +148,61 @@ unsigned int parse_wait_time(char *s, unsigned int default_wait_time) {
     return result;
 }
 
+watch_path_s *add_inotify_path(watch_state_s *state, int inotify_fd, char *path) {
+    int watch_fd = inotify_add_watch(inotify_fd, path,
+            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
+    );
+    // TODO probably don't to die in the general case, just on startup?
+    perr_die_if(watch_fd < 0, "inotify_add_watch");
+    watch_path_s *wp = alloc_watch_path(state);
+    // NOTE: watched paths are never freed
+    // they could be remove on delete calls in the future, but that would be more involved
+    // we'd possibly even want to recreate the entire tree for the base path to resync
+    wp->path = strdup(path);
+    wp->base = 0;
+    wp->fd = watch_fd;
+    return wp;
+}
+
+void recursively_watch_dirs(watch_state_s *state, int inotify_fd, char *path, watch_path_s *base) {
+    struct stat sb;
+    // TODO need to check if this should be lstat instead
+    // depends on if you can give symlinks to inotify
+    int rc = stat(path, &sb);
+    if (rc) {
+        perror("stat");
+        fprintf(stderr, "%s\n", path);
+    } else {
+        if (S_ISDIR(sb.st_mode)) {
+            watch_path_s *wp = add_inotify_path(state, inotify_fd, path);
+            wp->base = base;
+
+            watch_link_s *link = alloc_link(state);
+            link->wp = wp;
+            link->next = state->first_watched;
+            state->first_watched = link;
+
+            if (!base) {
+                // if we have no base, use the currently added on
+                base = wp;
+            }
+            DIR *dp = opendir(path);
+            struct dirent *ep;
+            if (dp) {
+                while ((ep = readdir(dp))) {
+                    if (ep->d_name[0] != '.') {
+                        char *fullpath;
+                        perr_die_if(asprintf(&fullpath, "%s/%s", path, ep->d_name) < 0, "asprintf");
+                        recursively_watch_dirs(state, inotify_fd, fullpath, base);
+                        free(fullpath);
+                    }
+                }
+                closedir(dp);
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         die_usage(argv[0], "<watch-path>");
@@ -155,21 +213,9 @@ int main(int argc, char *argv[]) {
     int inotify_fd = inotify_init();
     perr_die_if(inotify_fd < 0, "inotify_init");
     for (unsigned int arg_idx = 1; arg_idx < argc; arg_idx++) {
-        char *watch_path = argv[arg_idx];
-        int watch_fd = inotify_add_watch(
-            inotify_fd,
-            watch_path,
-            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
-        );
-        perr_die_if(watch_fd < 0, "inotify_add_watch");
-        watch_path_s *wp = alloc_watch_path(&state);
-        wp->fd = watch_fd;
-        wp->path = watch_path;
+        char *path_to_watch = argv[arg_idx];
 
-        watch_link_s *link = alloc_link(&state);
-        link->wp = wp;
-        link->next = state.first_watched;
-        state.first_watched = link;
+        recursively_watch_dirs(&state, inotify_fd, path_to_watch, NULL);
     }
 
     queue_state_s *queue_state = &state.queue_state;
@@ -199,7 +245,11 @@ int main(int argc, char *argv[]) {
             }
             for (watch_link_s *l = state.first_watched; l; l = l->next) {
                 if (e->wd == l->wp->fd) {
-                    state.first_dirty = add_watch_path_if_needed(&state, state.first_dirty, l->wp);
+                    watch_path_s *wp = l->wp;
+                    if (wp->base) {
+                        wp = wp->base;
+                    }
+                    state.first_dirty = add_watch_path_if_needed(&state, state.first_dirty, wp);
                     break;
                 }
             }
