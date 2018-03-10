@@ -6,96 +6,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <ram-err.h>
 #include <sys/inotify.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <pthread.h>
 #include <dirent.h>
-
-typedef struct watch_path_s {
-    char *path;
-    int fd;
-    struct watch_path_s *base;
-} watch_path_s;
-
-typedef struct watch_link_s {
-    watch_path_s *wp;
-    struct watch_link_s *next;
-} watch_link_s;
-
-typedef enum {
-    ProcState_None,
-    ProcState_Processing,
-    ProcState_Enqueueing,
-} proc_state_s;
+#include <ram-err.h>
+#include <ram-def.h>
 
 typedef struct {
-    watch_link_s *first_queue;
-    proc_state_s proc_state;
-    unsigned int wait_time;
+    u32 idx;
+} pathid_s;
+
+typedef struct {
+    int fd;
+    pathid_s pathid;
+} watch_info_s;
+
+// NOTE: this can be a chunked list if we want to allow this to grow
+typedef struct {
+    u32 n;
+    u32 cap;
+    watch_info_s *infos;
+} watch_infos_s;
+
+typedef struct {
+    u32 n_queue;
+    pathid_s *queue;
+    u32 mutex;
+    unsigned int sleep;
     pid_t pid;
 } queue_state_s;
 
 typedef struct {
-    watch_link_s *first_watched;
-    watch_link_s *first_dirty;
-    watch_link_s *first_queue;
-    watch_link_s *first_free;
-
+    int inotify_fd;
+    u32 n_paths;
+    char **paths;
+    watch_infos_s watch;
     queue_state_s queue_state;
 } watch_state_s;
-
-watch_path_s *alloc_watch_path(watch_state_s *state) {
-    watch_path_s *result = malloc(sizeof(watch_state_s));
-    result->fd = 0;
-    result->path = 0;
-    result->base = 0;
-    return result;
-}
-
-watch_link_s *alloc_link(watch_state_s *state) {
-    watch_link_s *result;
-    if (state->first_free) {
-        result = state->first_free;
-        state->first_free = state->first_free->next;
-    } else {
-        result = malloc(sizeof(watch_link_s));
-    }
-    result->next = 0;
-    result->wp = 0;
-    return result;
-}
-
-void free_link(watch_state_s *state, watch_link_s *link) {
-    link->next = state->first_free;
-    state->first_free = link;
-}
-
-watch_link_s *add_watch_path_if_needed(watch_state_s *state, watch_link_s *dest_list, watch_path_s *wp) {
-    // first check if in list already
-    for (watch_link_s *l = dest_list; l; l = l->next) {
-        if (l->wp->fd == wp->fd) {
-            return dest_list;
-        }
-    }
-    watch_link_s *new_link = alloc_link(state);
-    new_link->wp = wp;
-    new_link->next = dest_list;
-    return new_link;
-}
-
-bool enqueue_watch_paths(watch_state_s *state, queue_state_s *qs, watch_link_s *first_dirty) {
-    if (__sync_bool_compare_and_swap(&qs->proc_state, ProcState_None, ProcState_Enqueueing)) {
-        for (watch_link_s *l = first_dirty; l; l = l->next) {
-            qs->first_queue = add_watch_path_if_needed(state, qs->first_queue, l->wp);
-        }
-        qs->proc_state = ProcState_None;
-        return true;
-    } else {
-        return false;
-    }
-}
 
 void path_changed(queue_state_s *qs, char *path) {
     char tmpfile[32];
@@ -106,6 +55,7 @@ void path_changed(queue_state_s *qs, char *path) {
     perr_die_if(chdir(path) != 0, "chdir");
 
     FILE *pipe = popen(fullcmd, "r");
+    // TODO check exit code
     pclose(pipe);
 
     char tagspath[1024];
@@ -115,38 +65,36 @@ void path_changed(queue_state_s *qs, char *path) {
     puts(path);
 }
 
-void free_links(watch_state_s *state, watch_link_s *first_link) {
-    watch_link_s *l = first_link;
-    while (l) {
-        watch_link_s *next = l->next;
-        free_link(state, l);
-        l = next;
-    }
+char *lookup_path(watch_state_s *state, pathid_s path_id) {
+    assert(path_id.idx < state->n_paths);
+    char *result = state->paths[path_id.idx];
+    return result;
 }
 
 void *process_queue(void *pthread_data) {
     watch_state_s *state = pthread_data;
     queue_state_s *qs = &state->queue_state;
     for (;;) {
-        while (!__sync_bool_compare_and_swap(&qs->proc_state, ProcState_None, ProcState_Processing)) {
-            perr_die_if(pthread_yield() != 0,  "pthread_yield");
+        while (!__sync_bool_compare_and_swap(&qs->mutex, 0, 1)) {
+            perr_die_if(pthread_yield() != 0, "pthread_yield");
         }
 
-        for (watch_link_s *l = qs->first_queue; l; l = l->next) {
-            path_changed(qs, l->wp->path);
+        for (u32 i = 0; i < qs->n_queue; i++) {
+            pathid_s path_id = qs->queue[i];
+            char *path = lookup_path(state, path_id);
+            path_changed(qs, path);
         }
-        free_links(state, qs->first_queue);
+        // clear queue
+        qs->n_queue = 0;
+        qs->mutex = 0;
 
-        qs->first_queue = NULL;
-        qs->proc_state = ProcState_None;
-
-        sleep(qs->wait_time);
+        sleep(qs->sleep);
     }
     return NULL;
 }
 
-unsigned int parse_wait_time(char *s, unsigned int default_wait_time) {
-    unsigned int result = default_wait_time;
+unsigned int parse_sleep(char *s, unsigned int default_sleep) {
+    unsigned int result = default_sleep;
     if (s) {
         char *endptr = s;
         unsigned int parsed_val = strtol(s, &endptr, 10);
@@ -157,23 +105,7 @@ unsigned int parse_wait_time(char *s, unsigned int default_wait_time) {
     return result;
 }
 
-watch_path_s *add_inotify_path(watch_state_s *state, int inotify_fd, char *path) {
-    int watch_fd = inotify_add_watch(inotify_fd, path,
-            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
-    );
-    // TODO probably don't to die in the general case, just on startup?
-    perr_die_if(watch_fd < 0, "inotify_add_watch");
-    watch_path_s *wp = alloc_watch_path(state);
-    // NOTE: watched paths are never freed
-    // they could be remove on delete calls in the future, but that would be more involved
-    // we'd possibly even want to recreate the entire tree for the base path to resync
-    wp->path = strdup(path);
-    wp->base = 0;
-    wp->fd = watch_fd;
-    return wp;
-}
-
-void recursively_watch_dirs(watch_state_s *state, int inotify_fd, char *path, watch_path_s *base) {
+void recursively_watch_dirs(watch_state_s *state, char *path, pathid_s toplevel_pathid) {
     struct stat sb;
     // TODO need to check if this should be lstat instead
     // depends on if you can give symlinks to inotify
@@ -183,18 +115,16 @@ void recursively_watch_dirs(watch_state_s *state, int inotify_fd, char *path, wa
         fprintf(stderr, "%s\n", path);
     } else {
         if (S_ISDIR(sb.st_mode)) {
-            watch_path_s *wp = add_inotify_path(state, inotify_fd, path);
-            wp->base = base;
+            watch_infos_s *wis = &state->watch;
+            assert(wis->n < wis->cap);
+            watch_info_s *wi = wis->infos + wis->n++;
+            int watch_fd = inotify_add_watch(state->inotify_fd, path,
+                    IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
+            );
+            perr_die_if(watch_fd < 0, "inotify_add_watch");
+            wi->fd = watch_fd;
+            wi->pathid = toplevel_pathid;
 
-            watch_link_s *link = alloc_link(state);
-            link->wp = wp;
-            link->next = state->first_watched;
-            state->first_watched = link;
-
-            if (!base) {
-                // if we have no base, use the currently added on
-                base = wp;
-            }
             DIR *dp = opendir(path);
             struct dirent *ep;
             if (dp) {
@@ -202,12 +132,29 @@ void recursively_watch_dirs(watch_state_s *state, int inotify_fd, char *path, wa
                     if (ep->d_name[0] != '.') {
                         char fullpath[1024];
                         perr_die_if(snprintf(fullpath, sizeof(fullpath), "%s/%s", path, ep->d_name) >= sizeof(fullpath), "snprintf");
-                        recursively_watch_dirs(state, inotify_fd, fullpath, base);
+                        recursively_watch_dirs(state, fullpath, toplevel_pathid);
                     }
                 }
                 closedir(dp);
             }
         }
+    }
+}
+
+bool pathid_matches(pathid_s a, pathid_s b) {
+    return a.idx == b.idx;
+}
+
+void add_pathid(u32 *n, pathid_s *pathids, pathid_s pathid) {
+    u32 i;
+    for (i = 0; i < *n; i++) {
+        if (pathid_matches(pathids[i], pathid)) {
+            break;
+        }
+    }
+    if (i == *n) {
+        pathids[*n] = pathid;
+        *n += 1;
     }
 }
 
@@ -218,26 +165,38 @@ int main(int argc, char *argv[]) {
 
     watch_state_s state = {0};
 
-    int inotify_fd = inotify_init();
-    perr_die_if(inotify_fd < 0, "inotify_init");
-    for (unsigned int arg_idx = 1; arg_idx < argc; arg_idx++) {
-        char *path_to_watch = argv[arg_idx];
+    state.inotify_fd = inotify_init();
+    perr_die_if(state.inotify_fd < 0, "inotify_init");
 
-        recursively_watch_dirs(&state, inotify_fd, path_to_watch, NULL);
+    state.paths = argv + 1;
+    state.n_paths = argc - 1;
+
+    state.watch.cap = 4096;
+    state.watch.infos = malloc(sizeof(watch_info_s) * state.watch.cap);
+
+    for (u32 i = 0; i < state.n_paths; i++) {
+        pathid_s pathid = {.idx=i};
+        char *path_to_watch = state.paths[i];
+        recursively_watch_dirs(&state, path_to_watch, pathid);
     }
 
     queue_state_s *queue_state = &state.queue_state;
-    char *wait_time_str = getenv("WATCHTAGS_WAIT_TIME");
-    queue_state->wait_time = parse_wait_time(wait_time_str, 60);
+    char *sleep_str = getenv("WATCHTAGS_SLEEP");
+
+    queue_state->sleep = parse_sleep(sleep_str, 30);
     queue_state->pid = getpid();
+    queue_state->queue = malloc(sizeof(pathid_s) * state.n_paths);
 
     pthread_t thread;
     perr_die_if(pthread_create(&thread, NULL, process_queue, &state) != 0, "pthread_create");
 
     char inotify_buf[4096];
 
+    pathid_s *dirty_path_ids = malloc(sizeof(pathid_s) * state.n_paths);
+    u32 n_dirty_path_ids = 0;
+
     for (;;) {
-        ssize_t n = read(inotify_fd, inotify_buf, sizeof(inotify_buf));
+        ssize_t n = read(state.inotify_fd, inotify_buf, sizeof(inotify_buf));
         perr_die_if(n < 0, "read");
         for (char *p = inotify_buf; p < inotify_buf + n; p += sizeof(struct inotify_event)) {
             struct inotify_event *e = (struct inotify_event *)p;
@@ -246,22 +205,23 @@ int main(int argc, char *argv[]) {
                 // otherwise we'll get stuck in a loop!
                 continue;
             }
-            for (watch_link_s *l = state.first_watched; l; l = l->next) {
-                if (e->wd == l->wp->fd) {
-                    watch_path_s *wp = l->wp;
-                    if (wp->base) {
-                        wp = wp->base;
-                    }
-                    state.first_dirty = add_watch_path_if_needed(&state, state.first_dirty, wp);
+            for (u32 i = 0; i < state.watch.n; i++) {
+                watch_info_s *wi = state.watch.infos + i;
+                if (wi->fd == e->wd) {
+                    add_pathid(&n_dirty_path_ids, dirty_path_ids, wi->pathid);
                     break;
                 }
             }
         }
-        while (!enqueue_watch_paths(&state, queue_state, state.first_dirty)) {
-            perr_die_if(pthread_yield() != 0,  "pthread_yield");
+        while (!__sync_bool_compare_and_swap(&queue_state->mutex, 0, 1)) {
+            perr_die_if(pthread_yield() != 0, "pthread_yield");
         }
-        free_links(&state, state.first_dirty);
-        state.first_dirty = NULL;
+        for (u32 i = 0; i < n_dirty_path_ids; i++) {
+            pathid_s pathid = dirty_path_ids[i];
+            add_pathid(&queue_state->n_queue, queue_state->queue, pathid);
+        }
+        n_dirty_path_ids = 0;
+        queue_state->mutex = 0;
     }
 
     return 0;
