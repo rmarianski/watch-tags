@@ -168,8 +168,18 @@ int main(int argc, char *argv[]) {
     state.inotify_fd = inotify_init();
     perr_die_if(state.inotify_fd < 0, "inotify_init");
 
-    state.paths = argv + 1;
     state.n_paths = argc - 1;
+    size_t path_buf_size = sizeof(char *) * state.n_paths + PATH_MAX * state.n_paths;
+    state.paths = malloc(path_buf_size);
+    memset(state.paths, 0, path_buf_size);
+    char *path_buf = (char *)(state.paths + state.n_paths);
+    for (u32 i = 0; i < state.n_paths; i++) {
+        char *path = argv[i + 1];
+        char *abs_path = realpath(path, path_buf);
+        perr_die_if(!abs_path, "realpath");
+        state.paths[i] = path_buf;
+        path_buf += strlen(path_buf) + 1;
+    }
 
     state.watch.cap = 4096;
     state.watch.infos = malloc(sizeof(watch_info_s) * state.watch.cap);
