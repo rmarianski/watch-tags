@@ -19,8 +19,9 @@ typedef struct {
 } pathid_s;
 
 typedef struct {
-    int fd;
-    pathid_s pathid;
+    int wd;
+    pathid_s root;
+    char *path;
 } watch_info_s;
 
 // NOTE: this can be a chunked list if we want to allow this to grow
@@ -46,6 +47,10 @@ typedef struct {
     queue_state_s queue_state;
 } watch_state_s;
 
+void join_path(char *head, char *tail, size_t buf_size, char *buf) {
+    die_if(snprintf(buf, buf_size, "%s/%s", head, tail) >= buf_size, "snprintf");
+}
+
 void path_changed(queue_state_s *qs, char *path) {
     char tmpfile[32];
     die_if(snprintf(tmpfile, sizeof(tmpfile), "/tmp/watch-tags-%d", qs->pid) >= sizeof(tmpfile), "snprintf");
@@ -58,8 +63,8 @@ void path_changed(queue_state_s *qs, char *path) {
     // TODO check exit code
     pclose(pipe);
 
-    char tagspath[1024];
-    die_if(snprintf(tagspath, sizeof(tagspath), "%s/tags", path) >= sizeof(tagspath), "snprintf");
+    char tagspath[PATH_MAX];
+    join_path(path, "tags", sizeof(tagspath), tagspath);
     rename(tmpfile, tagspath);
 
     puts(path);
@@ -105,34 +110,44 @@ unsigned int parse_sleep(char *s, unsigned int default_sleep) {
     return result;
 }
 
-void recursively_watch_dirs(watch_state_s *state, char *path, pathid_s toplevel_pathid) {
+void watch_path(watch_state_s *state, char *fullpath, pathid_s toplevel_pathid) {
+    int wd = inotify_add_watch(state->inotify_fd, fullpath,
+            IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
+    );
+    if (wd < 0) {
+        perror("inotify_add_watch");
+        fprintf(stderr, "%s\n", fullpath);
+        return;
+    }
+    watch_infos_s *wis = &state->watch;
+    assert(wis->n < wis->cap);
+    watch_info_s *wi = wis->infos + wis->n++;
+    wi->wd = wd;
+    wi->root = toplevel_pathid;
+    wi->path = strdup(fullpath);
+}
+
+void recursively_watch_dirs(watch_state_s *state, char *fullpath, pathid_s toplevel_pathid) {
     struct stat sb;
     // TODO need to check if this should be lstat instead
     // depends on if you can give symlinks to inotify
-    int rc = stat(path, &sb);
+    int rc = stat(fullpath, &sb);
     if (rc) {
         perror("stat");
-        fprintf(stderr, "%s\n", path);
+        fprintf(stderr, "%s\n", fullpath);
     } else {
         if (S_ISDIR(sb.st_mode)) {
-            watch_infos_s *wis = &state->watch;
-            assert(wis->n < wis->cap);
-            watch_info_s *wi = wis->infos + wis->n++;
-            int watch_fd = inotify_add_watch(state->inotify_fd, path,
-                    IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE
-            );
-            perr_die_if(watch_fd < 0, "inotify_add_watch");
-            wi->fd = watch_fd;
-            wi->pathid = toplevel_pathid;
 
-            DIR *dp = opendir(path);
+            watch_path(state, fullpath, toplevel_pathid);
+
+            DIR *dp = opendir(fullpath);
             struct dirent *ep;
             if (dp) {
                 while ((ep = readdir(dp))) {
                     if (ep->d_name[0] != '.') {
-                        char fullpath[1024];
-                        perr_die_if(snprintf(fullpath, sizeof(fullpath), "%s/%s", path, ep->d_name) >= sizeof(fullpath), "snprintf");
-                        recursively_watch_dirs(state, fullpath, toplevel_pathid);
+                        char fulldirpath[PATH_MAX];
+                        join_path(fullpath, ep->d_name, sizeof(fulldirpath), fulldirpath);
+                        recursively_watch_dirs(state, fulldirpath, toplevel_pathid);
                     }
                 }
                 closedir(dp);
@@ -171,7 +186,6 @@ int main(int argc, char *argv[]) {
     state.n_paths = argc - 1;
     size_t path_buf_size = sizeof(char *) * state.n_paths + PATH_MAX * state.n_paths;
     state.paths = malloc(path_buf_size);
-    memset(state.paths, 0, path_buf_size);
     char *path_buf = (char *)(state.paths + state.n_paths);
     for (u32 i = 0; i < state.n_paths; i++) {
         char *path = argv[i + 1];
@@ -210,6 +224,9 @@ int main(int argc, char *argv[]) {
         perr_die_if(n < 0, "read");
         for (char *p = inotify_buf; p < inotify_buf + n; p += sizeof(struct inotify_event)) {
             struct inotify_event *e = (struct inotify_event *)p;
+            if (!e->mask) {
+                continue;
+            }
             if (strcmp(e->name, "tags") == 0) {
                 // it's important to ignore tags modifications
                 // otherwise we'll get stuck in a loop!
@@ -217,8 +234,15 @@ int main(int argc, char *argv[]) {
             }
             for (u32 i = 0; i < state.watch.n; i++) {
                 watch_info_s *wi = state.watch.infos + i;
-                if (wi->fd == e->wd) {
-                    add_pathid(&n_dirty_path_ids, dirty_path_ids, wi->pathid);
+                if (wi->wd == e->wd) {
+                    pathid_s pathid = wi->root;
+                    add_pathid(&n_dirty_path_ids, dirty_path_ids, pathid);
+
+                    if (e->mask & (IN_CREATE | IN_ISDIR)) {
+                        char fullpath[PATH_MAX];
+                        join_path(wi->path, e->name, sizeof(fullpath), fullpath);
+                        watch_path(&state, fullpath, pathid);
+                    }
                     break;
                 }
             }
